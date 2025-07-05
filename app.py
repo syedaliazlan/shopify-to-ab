@@ -190,7 +190,7 @@ def handle_product_webhook():
 
         if ab_id_meta and ab_id_meta.get('value'):
             print("⛔️ Product already created on AB. Skipping.")
-        elif status == "active" and "old" in tags and inventory > 0 and (not published_flag or published_flag.get("value") != "true"):
+        elif status == "active" and "old" in tags and inventory > 0 and is_in_smart_collection(product_id) and (not published_flag or published_flag.get("value") != "true"):
             print("✅ Creating new AB product...")
             send_to_ab(full_product)
         else:
