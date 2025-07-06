@@ -101,18 +101,45 @@ def send_to_ab(prod, ab_id=None):
         if not ab_id:
             new = r.json().get("nShopProd_ID")
             if new:
-                for key, val in [("ab_product_id", str(new)), ("published_on_ab", "true")]:
-                    requests.post(
-                        f"{REST_BASE}/products/{prod['id']}/metafields.json",
-                        headers=HEADERS,
-                        json={"metafield": {"namespace":"custom","key":key,"type":"single_line_text_field","value":val}}
-                    )
+                # ab_product_id (string)
+                requests.post(
+                    f"{REST_BASE}/products/{prod['id']}/metafields.json",
+                    headers=HEADERS,
+                    json={
+                        "metafield": {
+                            "namespace": "custom",
+                            "key": "ab_product_id",
+                            "type": "single_line_text_field",
+                            "value": str(new)
+                        }
+                    }
+                )
+                # published_on_ab (boolean)
+                requests.post(
+                    f"{REST_BASE}/products/{prod['id']}/metafields.json",
+                    headers=HEADERS,
+                    json={
+                        "metafield": {
+                            "namespace": "custom",
+                            "key": "published_on_ab",
+                            "type": "boolean",
+                            "value": "true"
+                        }
+                    }
+                )
         # always update hash
         h = compute_product_hash(prod)
         requests.post(
             f"{REST_BASE}/products/{prod['id']}/metafields.json",
             headers=HEADERS,
-            json={"metafield": {"namespace":"custom","key":"last_synced_hash","type":"single_line_text_field","value":h}}
+            json={
+                "metafield": {
+                    "namespace": "custom",
+                    "key": "last_synced_hash",
+                    "type": "single_line_text_field",
+                    "value": h
+                }
+            }
         )
     else:
         print("❌ AB sync error:", r.text)
@@ -150,14 +177,13 @@ def handle_webhook():
             print("⛔️ Create criteria not met")
 
     else:  # products/update
-        # deletion logic
         if abmf.get("value") and ("old" not in tags or status=="draft" or inv<=0):
             if check_ab_product_exists(abmf["value"]):
                 delete_ab_product(abmf["value"])
             clear_ab_metafields(pid)
             return "Deleted from AB", 200
 
-        # creation if coming back eligible
+        # recreate if valid again
         if not abmf.get("value") and status=="active" and "old" in tags and inv>0:
             print("🔁 Recreating product on AB")
             send_to_ab(prod)
