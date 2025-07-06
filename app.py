@@ -9,216 +9,153 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
 app = Flask(__name__)
 
-SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-WEBHOOK_CALLBACK_URL = os.getenv("WEBHOOK_CALLBACK_URL")
 AB_API_KEY = os.getenv("AB_API_KEY")
 DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
 
 SHOPIFY_API_VERSION = "2023-10"
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-}
+HEADERS = {"Content-Type": "application/json", "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
+GRAPHQL_URL = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2025-07/graphql.json"
 
 SMART_COLLECTION_ID = "676440899969"
 recently_handled = {}
 
-def is_debounced(product_id):
+def is_debounced(pid):
     now = time.time()
-    if product_id in recently_handled and now - recently_handled[product_id] < 15:
+    if pid in recently_handled and now - recently_handled[pid] < 15:
         return True
-    recently_handled[product_id] = now
+    recently_handled[pid] = now
     return False
 
-def compute_product_hash(product):
-    metafields = product.get("metafields", [])
-    get_meta = lambda key: next((m['value'] for m in metafields if m['namespace'] == 'custom' and m['key'] == key), "")
-
-    relevant_data = {
-        "title": product.get("title", ""),
-        "body_html": product.get("body_html", ""),
-        "price": product.get("variants", [{}])[0].get("price", ""),
-        "image": product.get("image", {}).get("src", ""),
-        "ab_category": get_meta("ab_category"),
-        "ab_period": get_meta("ab_period"),
-        "ab_item_nationality": get_meta("ab_item_nationality")
+def compute_product_hash(prod):
+    mf = prod.get("metafields", [])
+    getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), "")
+    rd = {
+        "title": prod.get("title",""),
+        "body_html": prod.get("body_html",""),
+        "price": prod.get("variants",[{}])[0].get("price",""),
+        "image": prod.get("image",{}).get("src",""),
+        "ab_category": getm("ab_category"), "ab_period": getm("ab_period"), "ab_item_nationality": getm("ab_item_nationality")
     }
+    return hashlib.sha256(json.dumps(rd, sort_keys=True).encode()).hexdigest()
 
-    hash_input = json.dumps(relevant_data, sort_keys=True).encode('utf-8')
-    return hashlib.sha256(hash_input).hexdigest()
+def remove_metafields_shopify(product_id, metafield_keys):
+    mutations = []
+    for key in metafield_keys:
+        mutations.append(f'''{{
+          namespace: "custom",
+          key: "{key}",
+          value: null
+        }}''')
+    mtfs = ", ".join(mutations)
+    gql = f'''
+    mutation wipe {{
+      productUpdate(input: {{
+        id: "gid://shopify/Product/{product_id}",
+        metafields: [ {mtfs} ]
+      }}) {{
+        userErrors {{ field message }}
+      }}
+    }}'''
+    resp = requests.post(GRAPHQL_URL, headers=HEADERS, json={"query": gql})
+    if resp.ok:
+        print(f"🧹 Cleared metafields {metafield_keys} on Shopify")
+    else:
+        print("❌ Failed to clear metafields:", resp.text)
 
-@app.route("/register_webhook", methods=["GET"])
-def register_webhook():
-    topics = ["products/update", "products/create"]
-    results = []
-    for topic in topics:
-        webhook_payload = {
-            "webhook": {
-                "topic": topic,
-                "address": f"{WEBHOOK_CALLBACK_URL}/webhook/products",
-                "format": "json"
-            }
-        }
-        url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/webhooks.json"
-        response = requests.post(url, headers=HEADERS, json=webhook_payload)
-        results.append({"topic": topic, "status": response.status_code, "body": response.json()})
-    return jsonify(results), 200
+def check_ab_product_exists(ab_id):
+    r = requests.get(f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}")
+    return r.status_code == 200 and r.json().get("status") == "success"
 
-def verify_webhook(data, hmac_header):
-    digest = hmac.new(
-        SHOPIFY_API_SECRET.encode('utf-8'),
-        data,
-        hashlib.sha256
-    ).digest()
-    calculated_hmac = base64.b64encode(digest).decode()
-    return hmac.compare_digest(calculated_hmac, hmac_header)
+def delete_ab_product(ab_id):
+    r = requests.delete(f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}")
+    print("🗑️ Deleted AB product" if r.status_code==200 else f"❌ AB delete failed ({r.status_code})")
 
-def is_in_smart_collection(product_id):
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/collections/{SMART_COLLECTION_ID}/products.json"
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code == 200:
-        products = response.json().get("products", [])
-        return any(str(prod.get("id")) == str(product_id) for prod in products)
-    return False
-
-def fetch_product(product_id):
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json"
-    response = requests.get(url, headers=HEADERS)
-    return response.json().get("product") if response.status_code == 200 else None
-
-def fetch_metafields(product_id):
-    metafields_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json"
-    meta_resp = requests.get(metafields_url, headers=HEADERS)
-    return meta_resp.json().get("metafields", []) if meta_resp.status_code == 200 else []
-
-def set_metafield(product_id, namespace, key, value_type, value):
-    metafield_payload = {
-        "metafield": {
-            "namespace": namespace,
-            "key": key,
-            "type": value_type,
-            "value": value
-        }
-    }
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json"
-    response = requests.post(url, headers=HEADERS, json=metafield_payload)
-    print(f"📝 Set metafield {key} → {value} (status {response.status_code}): {response.text}")
-
-def send_to_ab(product, ab_id=None):
-    metafields = product.get("metafields", [])
-    get_meta = lambda key: next((m['value'] for m in metafields if m['namespace'] == 'custom' and m['key'] == key), None)
-
-    price = product.get("variants", [{}])[0].get("price")
+def send_to_ab(prod, ab_id=None):
+    mf = prod.get("metafields", [])
+    getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), None)
+    price = prod.get("variants",[{}])[0].get("price")
     if not price and not DEFAULT_PRICE_RANGE_ID:
-        print("❌ Missing price and no default price range ID")
+        print("❌ Missing price")
         return
-
-    ab_data = {
-        "sShopProdName": product.get("title"),
-        "sDescription": product.get("body_html"),
-        "nShopProdCat_ID_1": get_meta("ab_category"),
-        "nShopProdPeriod_ID": get_meta("ab_period"),
-        "nNationality_ID": get_meta("ab_item_nationality")
-    }
-
+    d = {"sShopProdName": prod["title"], "sDescription": prod["body_html"],
+         "nShopProdCat_ID_1": getm("ab_category"), "nShopProdPeriod_ID": getm("ab_period"),
+         "nNationality_ID": getm("ab_item_nationality")}
     if price:
-        ab_data["nPrice"] = float(price)
-    elif DEFAULT_PRICE_RANGE_ID:
-        ab_data["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
-
-    image_url = product.get("image", {}).get("src")
-    if image_url:
-        ab_data["sImageURL_1"] = image_url
-
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    if ab_id:
-        url = f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}"
+        d["nPrice"] = float(price)
     else:
-        url = f"https://api.antiquesboutique.com/product/?sAPIKey={AB_API_KEY}"
-
-    response = requests.post(url, headers=headers, data=ab_data)
-
-    if response.status_code == 200:
+        d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
+    img = prod.get("image",{}).get("src")
+    if img: d["sImageURL_1"] = img
+    r = requests.post(f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
+                      headers={"Content-Type":"application/x-www-form-urlencoded"}, data=d)
+    if r.status_code==200:
         if not ab_id:
-            result = response.json()
-            ab_id = result.get("nShopProd_ID")
-            if ab_id:
-                set_metafield(product["id"], "custom", "ab_product_id", "single_line_text_field", str(ab_id))
-                set_metafield(product["id"], "custom", "published_on_ab", "boolean", "true")
-
-        product_hash = compute_product_hash(product)
-        set_metafield(product["id"], "custom", "last_synced_hash", "single_line_text_field", product_hash)
+            new = r.json().get("nShopProd_ID")
+            if new:
+                requests.post(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{prod['id']}/metafields.json",
+                              headers=HEADERS, json={"metafield":{"namespace":"custom","key":"ab_product_id","type":"single_line_text_field","value":str(new)}})
+                requests.post(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{prod['id']}/metafields.json",
+                              headers=HEADERS, json={"metafield":{"namespace":"custom","key":"published_on_ab","type":"boolean","value":"true"}})
+        h = compute_product_hash(prod)
+        requests.post(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{prod['id']}/metafields.json",
+                      headers=HEADERS, json={"metafield":{"namespace":"custom","key":"last_synced_hash","type":"single_line_text_field","value":h}})
     else:
-        print(f"❌ AB API Error {response.status_code}: {response.text}")
+        print("❌ AB sync error:", r.text)
 
 @app.route("/webhook/products", methods=["POST"])
-def handle_product_webhook():
+def handle_webhook():
     data = request.get_data()
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-
-    if not verify_webhook(data, hmac_header):
+    if not hmac.compare_digest(base64.b64encode(hmac.new(SHOPIFY_API_SECRET.encode(), data, hashlib.sha256).digest()).decode(),
+                               request.headers.get("X-Shopify-Hmac-Sha256")):
         abort(401)
-
     payload = json.loads(data)
-    topic = request.headers.get("X-Shopify-Topic")
-    product_id = payload.get("id")
-
-    if is_debounced(product_id):
-        print("⏳ Debounced: recently handled.")
+    pid = payload.get("id")
+    if is_debounced(pid):
         return "Debounced", 200
 
-    if topic == "products/create":
+    prod = requests.get(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{pid}.json", headers=HEADERS).json().get("product")
+    mfs = requests.get(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{pid}/metafields.json", headers=HEADERS).json().get("metafields", [])
+    prod["metafields"] = mfs
+
+    tags = prod.get("tags","").lower()
+    status = prod.get("status")
+    inv = sum(v.get("inventory_quantity",0) for v in prod.get("variants",[]))
+    ab = next((m for m in mfs if m["namespace"]=="custom" and m["key"]=="ab_product_id"),{})
+    published = next((m for m in mfs if m["namespace"]=="custom" and m["key"]=="published_on_ab"),{})
+
+    if request.headers.get("X-Shopify-Topic") == "products/create":
         time.sleep(3)
-        full_product = fetch_product(product_id)
-        metafields = fetch_metafields(product_id)
-        full_product["metafields"] = metafields
-
-        tags = full_product.get("tags", "").lower()
-        status = full_product.get("status")
-        variants = full_product.get("variants", [])
-        inventory = sum([v.get("inventory_quantity", 0) for v in variants])
-
-        ab_id_meta = next((m for m in metafields if m['namespace'] == 'custom' and m['key'] == 'ab_product_id'), None)
-        published_flag = next((m for m in metafields if m['namespace'] == 'custom' and m['key'] == 'published_on_ab'), None)
-
-        if ab_id_meta and ab_id_meta.get('value'):
-            print("⛔️ Product already created on AB. Skipping.")
-        elif status == "active" and "old" in tags and inventory > 0 and (not published_flag or published_flag.get("value") != "true"):
+        if ab.get("value"):
+            print("⛔️ Already on AB, skip creation.")
+        elif status=="active" and "old" in tags and inv>0 and (not published.get("value") or published["value"]!="true"):
             print("✅ Creating new AB product...")
-            send_to_ab(full_product)
+            send_to_ab(prod)
         else:
-            print("⛔️ Skipping create: Conditions not met.")
+            print("⛔️ Create criteria not met.")
 
-    elif topic == "products/update":
-        full_product = fetch_product(product_id)
-        metafields = fetch_metafields(product_id)
-        full_product["metafields"] = metafields
+    else:  # products/update
+        if ab.get("value"):
+            if "old" not in tags or status=="draft" or inv<=0:
+                if check_ab_product_exists(ab["value"]):
+                    print("🛑 Deleting from AB…")
+                    delete_ab_product(ab["value"])
+                    remove_metafields_shopify(pid, ["ab_product_id", "published_on_ab"])
+                else:
+                    print("⚠️ AB not found, skipping deletion.")
+                return "Deleted from AB", 200
 
-        ab_id_meta = next((m for m in metafields if m['namespace'] == 'custom' and m['key'] == 'ab_product_id'), None)
-        if not ab_id_meta or not ab_id_meta.get('value'):
-            print("⛔️ Skipping update: No ab_product_id present")
-            return "No AB ID", 200
-
-        last_hash_meta = next((m for m in metafields if m['namespace'] == 'custom' and m['key'] == 'last_synced_hash'), None)
-        last_saved_hash = last_hash_meta.get('value') if last_hash_meta else None
-        current_hash = compute_product_hash(full_product)
-
-        if current_hash == last_saved_hash:
-            print("⏩ No changes detected. Skipping AB update.")
-            return "No changes", 200
-
-        if is_in_smart_collection(product_id):
+        curr_hash = compute_product_hash(prod)
+        last = next((m["value"] for m in mfs if m["namespace"]=="custom" and m["key"]=="last_synced_hash"), None)
+        if curr_hash != last and ab.get("value") and "old" in tags:
             print("🔄 Updating AB product...")
-            send_to_ab(full_product, ab_id=ab_id_meta["value"])
+            send_to_ab(prod, ab_id=ab["value"])
         else:
-            print("⛔️ Skipping update: Product not in smart collection")
+            print("⛔️ Update criteria not met or no change.")
 
     return "Webhook processed", 200
 
