@@ -11,11 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 app = Flask(__name__)
 
+# Load environment variables
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 AB_API_KEY = os.getenv("AB_API_KEY")
 DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
+WEBHOOK_CALLBACK_URL = os.getenv("WEBHOOK_CALLBACK_URL")
 
 SHOPIFY_API_VERSION = "2023-10"
 HEADERS = {
@@ -27,12 +29,34 @@ REST_BASE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
 SMART_COLLECTION_ID = "676440899969"
 recently_handled = {}
 
+# Register webhook endpoint
+@app.route("/register_webhook", methods=["GET"])
+def register_webhook():
+    topics = ["products/create", "products/update"]
+    results = []
+    for topic in topics:
+        payload = {
+            "webhook": {
+                "topic": topic,
+                "address": f"{WEBHOOK_CALLBACK_URL}/webhook/products",
+                "format": "json"
+            }
+        }
+        url = f"{REST_BASE}/webhooks.json"
+        response = requests.post(url, headers=HEADERS, json=payload)
+        results.append({"topic": topic, "status": response.status_code, "body": response.json()})
+    return jsonify(results), 200
+
+# Simple debouncer to avoid duplicate processing
+
 def is_debounced(pid):
     now = time.time()
     if pid in recently_handled and now - recently_handled[pid] < 15:
         return True
     recently_handled[pid] = now
     return False
+
+# Generate hash of relevant product data for change tracking
 
 def compute_product_hash(prod):
     mf = prod.get("metafields", [])
@@ -47,6 +71,8 @@ def compute_product_hash(prod):
         "ab_item_nationality": getm("ab_item_nationality")
     }
     return hashlib.sha256(json.dumps(rd, sort_keys=True).encode()).hexdigest()
+
+# Shopify API helpers
 
 def fetch_product(pid):
     return requests.get(f"{REST_BASE}/products/{pid}.json", headers=HEADERS).json().get("product")
@@ -63,6 +89,8 @@ def clear_ab_metafields(pid):
         if mf['namespace'] == 'custom' and mf['key'] in ['ab_product_id','published_on_ab','last_synced_hash']:
             delete_metafield(pid, mf['id'])
 
+# Antiques Boutique API helpers
+
 def check_ab_product_exists(ab_id):
     r = requests.get(f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}")
     return r.status_code == 200 and r.json().get("status") == "success"
@@ -75,75 +103,60 @@ def send_to_ab(prod, ab_id=None):
     mf = prod.get("metafields", [])
     getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), None)
     price = prod.get("variants",[{}])[0].get("price")
+    sku = prod.get("variants",[{}])[0].get("sku")
+
     if not price and not DEFAULT_PRICE_RANGE_ID:
         print("❌ Missing price")
         return
+
     d = {
+        "sRef": sku,
         "sShopProdName": prod["title"],
         "sDescription": prod["body_html"],
         "nShopProdCat_ID_1": getm("ab_category"),
         "nShopProdPeriod_ID": getm("ab_period"),
         "nNationality_ID": getm("ab_item_nationality")
     }
+
     if price:
         d["nPrice"] = float(price)
     else:
         d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
+
     img = prod.get("image",{}).get("src")
-    if img: d["sImageURL_1"] = img
+    if img:
+        d["sImageURL_1"] = img
 
     r = requests.post(
         f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
         headers={"Content-Type":"application/x-www-form-urlencoded"},
         data=d
     )
+
     if r.status_code == 200:
         if not ab_id:
             new = r.json().get("nShopProd_ID")
             if new:
-                # ab_product_id (string)
                 requests.post(
                     f"{REST_BASE}/products/{prod['id']}/metafields.json",
                     headers=HEADERS,
-                    json={
-                        "metafield": {
-                            "namespace": "custom",
-                            "key": "ab_product_id",
-                            "type": "single_line_text_field",
-                            "value": str(new)
-                        }
-                    }
+                    json={"metafield": {"namespace": "custom", "key": "ab_product_id", "type": "single_line_text_field", "value": str(new)}}
                 )
-                # published_on_ab (boolean)
                 requests.post(
                     f"{REST_BASE}/products/{prod['id']}/metafields.json",
                     headers=HEADERS,
-                    json={
-                        "metafield": {
-                            "namespace": "custom",
-                            "key": "published_on_ab",
-                            "type": "boolean",
-                            "value": "true"
-                        }
-                    }
+                    json={"metafield": {"namespace": "custom", "key": "published_on_ab", "type": "boolean", "value": "true"}}
                 )
-        # always update hash
         h = compute_product_hash(prod)
         requests.post(
             f"{REST_BASE}/products/{prod['id']}/metafields.json",
             headers=HEADERS,
-            json={
-                "metafield": {
-                    "namespace": "custom",
-                    "key": "last_synced_hash",
-                    "type": "single_line_text_field",
-                    "value": h
-                }
-            }
+            json={"metafield": {"namespace": "custom", "key": "last_synced_hash", "type": "single_line_text_field", "value": h}}
         )
     else:
         print("❌ AB sync error:", r.text)
 
+# Webhook listener
 @app.route("/webhook/products", methods=["POST"])
 def handle_webhook():
     data = request.get_data()
@@ -183,13 +196,11 @@ def handle_webhook():
             clear_ab_metafields(pid)
             return "Deleted from AB", 200
 
-        # recreate if valid again
         if not abmf.get("value") and status=="active" and "old" in tags and inv>0:
             print("🔁 Recreating product on AB")
             send_to_ab(prod)
             return "Recreated on AB", 200
 
-        # update logic
         last = next((m["value"] for m in prod["metafields"] if m["namespace"]=="custom" and m["key"]=="last_synced_hash"), None)
         new_hash = compute_product_hash(prod)
         if new_hash != last and abmf.get("value") and "old" in tags and status=="active" and inv>0:
@@ -200,5 +211,6 @@ def handle_webhook():
 
     return "Webhook processed", 200
 
+# Start Flask app
 if __name__ == "__main__":
     app.run()
