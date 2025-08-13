@@ -14,6 +14,7 @@ app = Flask(__name__)
 # Load environment variables
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")
+SHOPIFY_PUBLIC_DOMAIN = os.getenv("SHOPIFY_PUBLIC_DOMAIN", SHOPIFY_STORE_DOMAIN)  # NEW (optional)
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 AB_API_KEY = os.getenv("AB_API_KEY")
 DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
@@ -59,10 +60,8 @@ def is_debounced(pid):
 def compute_product_hash(prod):
     mf = prod.get("metafields", [])
     getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), "")
-    # include first 20 image URLs so image changes cause an update
     images = [img.get("src","") for img in (prod.get("images") or [])][:20]
     if not images:
-        # fallback to main image if gallery empty
         main_img = prod.get("image",{}).get("src","")
         images = [main_img] if main_img else []
     rd = {
@@ -70,6 +69,7 @@ def compute_product_hash(prod):
         "body_html": prod.get("body_html",""),
         "price": prod.get("variants",[{}])[0].get("price",""),
         "images": images,
+        "handle": prod.get("handle",""),  # NEW: include URL driver in hash
         "ab_category": getm("ab_category"),
         "ab_period": getm("ab_period"),
         "ab_item_nationality": getm("ab_item_nationality")
@@ -125,18 +125,19 @@ def send_to_ab(prod, ab_id=None):
     else:
         d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
 
-    # --- NEW: map full gallery images to sImageURL_1..20 (first required) ---
-    # Prefer gallery; if empty, fallback to main image.
+    # Multi-image mapping (up to 20)
     gallery = [img.get("src","") for img in (prod.get("images") or []) if img.get("src")]
     if not gallery:
         main_img = prod.get("image",{}).get("src")
         if main_img:
             gallery = [main_img]
-
-    # Set up to 20 images per AB docs
     for idx, url in enumerate(gallery[:20], start=1):
         d[f"sImageURL_{idx}"] = url
-    # ------------------------------------------------------------------------
+
+    # NEW: External URL to the live Shopify product page
+    handle = prod.get("handle")
+    if handle:
+        d["sExternalURL"] = f"https://{SHOPIFY_PUBLIC_DOMAIN}/products/{handle}"
 
     r = requests.post(
         f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
