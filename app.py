@@ -48,7 +48,6 @@ def register_webhook():
     return jsonify(results), 200
 
 # Simple debouncer to avoid duplicate processing
-
 def is_debounced(pid):
     now = time.time()
     if pid in recently_handled and now - recently_handled[pid] < 15:
@@ -57,15 +56,20 @@ def is_debounced(pid):
     return False
 
 # Generate hash of relevant product data for change tracking
-
 def compute_product_hash(prod):
     mf = prod.get("metafields", [])
     getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), "")
+    # include first 20 image URLs so image changes cause an update
+    images = [img.get("src","") for img in (prod.get("images") or [])][:20]
+    if not images:
+        # fallback to main image if gallery empty
+        main_img = prod.get("image",{}).get("src","")
+        images = [main_img] if main_img else []
     rd = {
         "title": prod.get("title",""),
         "body_html": prod.get("body_html",""),
         "price": prod.get("variants",[{}])[0].get("price",""),
-        "image": prod.get("image",{}).get("src",""),
+        "images": images,
         "ab_category": getm("ab_category"),
         "ab_period": getm("ab_period"),
         "ab_item_nationality": getm("ab_item_nationality")
@@ -73,7 +77,6 @@ def compute_product_hash(prod):
     return hashlib.sha256(json.dumps(rd, sort_keys=True).encode()).hexdigest()
 
 # Shopify API helpers
-
 def fetch_product(pid):
     return requests.get(f"{REST_BASE}/products/{pid}.json", headers=HEADERS).json().get("product")
 
@@ -90,7 +93,6 @@ def clear_ab_metafields(pid):
             delete_metafield(pid, mf['id'])
 
 # Antiques Boutique API helpers
-
 def check_ab_product_exists(ab_id):
     r = requests.get(f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}")
     return r.status_code == 200 and r.json().get("status") == "success"
@@ -123,9 +125,18 @@ def send_to_ab(prod, ab_id=None):
     else:
         d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
 
-    img = prod.get("image",{}).get("src")
-    if img:
-        d["sImageURL_1"] = img
+    # --- NEW: map full gallery images to sImageURL_1..20 (first required) ---
+    # Prefer gallery; if empty, fallback to main image.
+    gallery = [img.get("src","") for img in (prod.get("images") or []) if img.get("src")]
+    if not gallery:
+        main_img = prod.get("image",{}).get("src")
+        if main_img:
+            gallery = [main_img]
+
+    # Set up to 20 images per AB docs
+    for idx, url in enumerate(gallery[:20], start=1):
+        d[f"sImageURL_{idx}"] = url
+    # ------------------------------------------------------------------------
 
     r = requests.post(
         f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
