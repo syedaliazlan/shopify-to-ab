@@ -14,7 +14,6 @@ app = Flask(__name__)
 # Load environment variables
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")
-SHOPIFY_PUBLIC_DOMAIN = os.getenv("SHOPIFY_PUBLIC_DOMAIN", SHOPIFY_STORE_DOMAIN)  # NEW: used for sExternalURL
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 AB_API_KEY = os.getenv("AB_API_KEY")
 DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
@@ -57,7 +56,6 @@ def is_debounced(pid):
     return False
 
 # Generate hash of relevant product data for change tracking
-# (UNCHANGED: keeps your original fields & behavior)
 def compute_product_hash(prod):
     mf = prod.get("metafields", [])
     getm = lambda k: next((m['value'] for m in mf if m['namespace']=='custom' and m['key']==k), "")
@@ -65,7 +63,7 @@ def compute_product_hash(prod):
         "title": prod.get("title",""),
         "body_html": prod.get("body_html",""),
         "price": prod.get("variants",[{}])[0].get("price",""),
-        "image": prod.get("image",{}).get("src",""),
+        "images": sorted([img.get('src', '') for img in prod.get("images", [])]),
         "ab_category": getm("ab_category"),
         "ab_period": getm("ab_period"),
         "ab_item_nationality": getm("ab_item_nationality")
@@ -78,6 +76,14 @@ def fetch_product(pid):
 
 def fetch_metafields(pid):
     return requests.get(f"{REST_BASE}/products/{pid}/metafields.json", headers=HEADERS).json().get("metafields", [])
+
+def set_metafield(pid, data):
+    """Helper to create/update a metafield."""
+    requests.post(
+        f"{REST_BASE}/products/{pid}/metafields.json",
+        headers=HEADERS,
+        json={"metafield": data}
+    )
 
 def delete_metafield(pid, mf_id):
     requests.delete(f"{REST_BASE}/products/{pid}/metafields/{mf_id}.json", headers=HEADERS)
@@ -121,51 +127,44 @@ def send_to_ab(prod, ab_id=None):
     else:
         d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
 
-    # --- CHANGE #1: Multi-image support (up to 20) ---
-    gallery = [img.get("src") for img in (prod.get("images") or []) if img.get("src")]
-    if not gallery:
-        # fallback to main image if gallery empty
-        main_img = prod.get("image",{}).get("src")
-        if main_img:
-            gallery = [main_img]
-    for idx, url in enumerate(gallery[:20], start=1):
-        d[f"sImageURL_{idx}"] = url
-    # --------------------------------------------------
+    if prod.get("handle"):
+        d["sExternalURL"] = f"https://{SHOPIFY_STORE_DOMAIN}/products/{prod['handle']}"
 
-    # --- CHANGE #2: Public External URL ---
-    handle = prod.get("handle")
-    if handle:
-        d["sExternalURL"] = f"https://{SHOPIFY_PUBLIC_DOMAIN}/products/{handle}"
-    # --------------------------------------
+    images = prod.get("images", [])
+    if images:
+        for i, image in enumerate(images[:20], 1):
+            image_url = image.get("src")
+            if image_url:
+                d[f"sImageURL_{i}"] = image_url
 
-    r = requests.post(
-        f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
-        headers={"Content-Type":"application/x-www-form-urlencoded"},
-        data=d
-    )
-
-    if r.status_code == 200:
-        if not ab_id:
-            new = r.json().get("nShopProd_ID")
-            if new:
-                requests.post(
-                    f"{REST_BASE}/products/{prod['id']}/metafields.json",
-                    headers=HEADERS,
-                    json={"metafield": {"namespace": "custom", "key": "ab_product_id", "type": "single_line_text_field", "value": str(new)}}
-                )
-                requests.post(
-                    f"{REST_BASE}/products/{prod['id']}/metafields.json",
-                    headers=HEADERS,
-                    json={"metafield": {"namespace": "custom", "key": "published_on_ab", "type": "boolean", "value": "true"}}
-                )
-        h = compute_product_hash(prod)
-        requests.post(
-            f"{REST_BASE}/products/{prod['id']}/metafields.json",
-            headers=HEADERS,
-            json={"metafield": {"namespace": "custom", "key": "last_synced_hash", "type": "single_line_text_field", "value": h}}
+    try:
+        r = requests.post(
+            f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
+            headers={"Content-Type":"application/x-www-form-urlencoded"},
+            data=d,
+            timeout=60  # ADDED: Generous 60-second timeout for the slow API
         )
-    else:
-        print("❌ AB sync error:", r.text)
+        r.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        response_json = r.json()
+        if response_json.get("status") == "success":
+            if not ab_id:
+                new_ab_id = response_json.get("nShopProd_ID")
+                if new_ab_id:
+                    set_metafield(prod['id'], {"namespace": "custom", "key": "ab_product_id", "type": "single_line_text_field", "value": str(new_ab_id)})
+
+            new_hash = compute_product_hash(prod)
+            set_metafield(prod['id'], {"namespace": "custom", "key": "last_synced_hash", "type": "single_line_text_field", "value": new_hash})
+            print(f"✅ Successfully synced product {prod['id']} to AB.")
+        else:
+            print(f"❌ AB sync failed with status: {response_json.get('status')}, Message: {response_json.get('message')}")
+            # If creation failed, we should reset the 'published_on_ab' flag so we can try again later.
+            clear_ab_metafields(prod['id'])
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ AB sync error (Request Exception): {e}")
+        # If the request fails (e.g., timeout), we also reset the metafields to allow a future retry.
+        clear_ab_metafields(prod['id'])
 
 # Webhook listener
 @app.route("/webhook/products", methods=["POST"])
@@ -181,6 +180,9 @@ def handle_webhook():
         return "Debounced", 200
 
     prod = fetch_product(pid)
+    if not prod:
+        return "Product not found.", 404
+        
     prod["metafields"] = fetch_metafields(pid)
 
     tags = prod.get("tags","").lower()
@@ -192,15 +194,20 @@ def handle_webhook():
     topic = request.headers.get("X-Shopify-Topic")
     if topic == "products/create":
         time.sleep(3)
-        if abmf.get("value"):
-            print("⛔️ Already on AB")
-        elif status=="active" and "old" in tags and inv>0 and (not published.get("value") or published["value"]!="true"):
-            print("✅ Creating new AB product")
+        # Check if the product meets the criteria to be published
+        should_publish = status == "active" and "old" in tags and inv > 0
+        # Check if it has already been published or an attempt was made
+        is_already_published = abmf.get("value") or (published.get("value") and published["value"] == "true")
+        
+        if should_publish and not is_already_published:
+            print(f"✅ Criteria met for new product {pid}. Attempting to create on AB.")
+            # MODIFIED: Set 'published_on_ab' to true BEFORE the slow API call to prevent retry loops.
+            set_metafield(pid, {"namespace": "custom", "key": "published_on_ab", "type": "boolean", "value": "true"})
             send_to_ab(prod)
         else:
-            print("⛔️ Create criteria not met")
+            print(f"⛔️ Create criteria not met for product {pid} or already published.")
 
-    else:  # products/update
+    elif topic == "products/update":
         if abmf.get("value") and ("old" not in tags or status=="draft" or inv<=0):
             if check_ab_product_exists(abmf["value"]):
                 delete_ab_product(abmf["value"])
@@ -208,17 +215,21 @@ def handle_webhook():
             return "Deleted from AB", 200
 
         if not abmf.get("value") and status=="active" and "old" in tags and inv>0:
-            print("🔁 Recreating product on AB")
-            send_to_ab(prod)
-            return "Recreated on AB", 200
+            # This logic also applies the optimistic lock to prevent loops on recreation
+            is_already_published = published.get("value") and published["value"] == "true"
+            if not is_already_published:
+                print(f"🔁 Recreating product {pid} on AB")
+                set_metafield(pid, {"namespace": "custom", "key": "published_on_ab", "type": "boolean", "value": "true"})
+                send_to_ab(prod)
+                return "Recreation attempt started on AB", 200
 
         last = next((m["value"] for m in prod["metafields"] if m["namespace"]=="custom" and m["key"]=="last_synced_hash"), None)
         new_hash = compute_product_hash(prod)
         if new_hash != last and abmf.get("value") and "old" in tags and status=="active" and inv>0:
-            print("🔄 Updating AB product")
+            print(f"🔄 Updating AB product {pid}")
             send_to_ab(prod, ab_id=abmf["value"])
         else:
-            print("⛔️ No AB update or sync needed")
+            print(f"⛔️ No AB update or sync needed for product {pid}")
 
     return "Webhook processed", 200
 
