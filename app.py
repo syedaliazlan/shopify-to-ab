@@ -61,7 +61,7 @@ def is_debounced(pid, topic):
     recently_handled[key] = now
     return False
 
-# ── Async worker infra (started per Gunicorn worker) ───────────────────────────
+# ── Async worker infra ─────────────────────────────────────────────────────────
 task_q: queue.Queue = queue.Queue(maxsize=1000)
 _worker_started = False
 _worker_lock = threading.Lock()
@@ -83,15 +83,23 @@ def worker_loop():
             except Exception:
                 pass
 
-@app.before_first_request
 def start_worker_if_needed():
+    """Start the background worker once per process; safe to call many times."""
     global _worker_started
+    if _worker_started:
+        return
     with _worker_lock:
-        if not _worker_started:
-            t = threading.Thread(target=worker_loop, daemon=True)
-            t.start()
-            _worker_started = True
-            log("✅ background worker started in this process")
+        if _worker_started:
+            return
+        t = threading.Thread(target=worker_loop, daemon=True)
+        t.start()
+        _worker_started = True
+        log("✅ background worker started in this process")
+
+# Works on all Flask versions
+@app.before_request
+def _ensure_worker():
+    start_worker_if_needed()
 
 # ── Shopify helpers ────────────────────────────────────────────────────────────
 def fetch_product(pid):
@@ -293,7 +301,7 @@ def health():
 @app.route("/diag", methods=["GET"])
 def diag():
     return jsonify({
-        "worker_started": _worker_started,
+        "worker_started": _ensure_worker is not None and _worker_started,
         "queue_size": task_q.qsize(),
     }), 200
 
