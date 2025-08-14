@@ -4,6 +4,8 @@ import hashlib
 import base64
 import json
 import time
+import threading
+import queue
 from flask import Flask, request, abort, jsonify
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,13 +16,13 @@ load_dotenv()
 app = Flask(__name__)
 
 # ── ENV ────────────────────────────────────────────────────────────────────────
-SHOPIFY_API_SECRET   = os.getenv("SHOPIFY_API_SECRET")
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")          # admin domain
-SHOPIFY_PUBLIC_DOMAIN= os.getenv("SHOPIFY_PUBLIC_DOMAIN", SHOPIFY_STORE_DOMAIN)  # public site (set this!)
-SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-AB_API_KEY           = os.getenv("AB_API_KEY")
-DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
-WEBHOOK_CALLBACK_URL = os.getenv("WEBHOOK_CALLBACK_URL","").rstrip("/")  # normalize
+SHOPIFY_API_SECRET    = os.getenv("SHOPIFY_API_SECRET")
+SHOPIFY_STORE_DOMAIN  = os.getenv("SHOPIFY_STORE_DOMAIN")                     # admin domain
+SHOPIFY_PUBLIC_DOMAIN = os.getenv("SHOPIFY_PUBLIC_DOMAIN", SHOPIFY_STORE_DOMAIN)  # public storefront domain
+SHOPIFY_ACCESS_TOKEN  = os.getenv("SHOPIFY_ACCESS_TOKEN")
+AB_API_KEY            = os.getenv("AB_API_KEY")
+DEFAULT_PRICE_RANGE_ID= os.getenv("DEFAULT_PRICE_RANGE_ID")
+WEBHOOK_CALLBACK_URL  = (os.getenv("WEBHOOK_CALLBACK_URL") or "").rstrip("/")  # normalise
 
 SHOPIFY_API_VERSION = "2023-10"
 HEADERS = {
@@ -29,10 +31,11 @@ HEADERS = {
 }
 REST_BASE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
 
-# ── HTTP session with retries/timeouts ─────────────────────────────────────────
+# ── HTTP session with retries + timeouts ───────────────────────────────────────
 SESSION = requests.Session()
 retries = Retry(
-    total=3, backoff_factor=0.5,
+    total=3,
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods={"GET","POST","DELETE"}
 )
@@ -40,54 +43,35 @@ SESSION.mount("https://", HTTPAdapter(max_retries=retries))
 SESSION.mount("http://",  HTTPAdapter(max_retries=retries))
 DEFAULT_TIMEOUT = (5, 25)  # (connect, read)
 
-# ── State ──────────────────────────────────────────────────────────────────────
-recently_handled = {}
+# ── State / debounce ───────────────────────────────────────────────────────────
 DEBOUNCE_WINDOW = 30  # seconds
+recently_handled = {}  # (pid:topic) -> ts
 
-SMART_COLLECTION_ID = "676440899969"  # unchanged, not used in webhook flow
-
-# ── Helpers: Debounce ──────────────────────────────────────────────────────────
 def is_debounced(pid, topic):
-    now = time.time()
     key = f"{pid}:{topic}"
+    now = time.time()
     if key in recently_handled and now - recently_handled[key] < DEBOUNCE_WINDOW:
         return True
     recently_handled[key] = now
     return False
 
-# ── Webhook registration & audit ───────────────────────────────────────────────
-@app.route("/register_webhook", methods=["GET"])
-def register_webhook():
-    topics = ["products/create", "products/update"]
-    results = []
-    existing = SESSION.get(f"{REST_BASE}/webhooks.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT).json().get("webhooks", [])
-    for topic in topics:
-        addr = f"{WEBHOOK_CALLBACK_URL}/webhook/products"
-        if any(w["topic"]==topic and w["address"]==addr for w in existing):
-            results.append({"topic": topic, "status": "exists"})
-            continue
-        payload = {"webhook": {"topic": topic, "address": addr, "format": "json"}}
-        resp = SESSION.post(f"{REST_BASE}/webhooks.json", headers=HEADERS, json=payload, timeout=DEFAULT_TIMEOUT)
-        results.append({"topic": topic, "status": resp.status_code, "body": resp.json()})
-    return jsonify(results), 200
+# ── Small async worker for webhook tasks ───────────────────────────────────────
+task_q: queue.Queue = queue.Queue(maxsize=1000)
 
-@app.route("/webhooks_audit", methods=["POST"])
-def webhooks_audit():
-    data = request.get_json(silent=True) or {}
-    fix = bool(data.get("fix"))
-    addr = f"{WEBHOOK_CALLBACK_URL}/webhook/products"
-    res = SESSION.get(f"{REST_BASE}/webhooks.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT).json()
-    webhooks = res.get("webhooks", [])
-    report = {}
-    for topic in ("products/create","products/update"):
-        matches = [w for w in webhooks if w["topic"]==topic and w["address"]==addr]
-        report[topic] = [{"id": w["id"], "address": w["address"]} for w in matches]
-        if fix and len(matches)>1:
-            keep = max(matches, key=lambda w: w["created_at"])
-            for w in matches:
-                if w["id"] != keep["id"]:
-                    SESSION.delete(f"{REST_BASE}/webhooks/{w['id']}.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT)
-    return jsonify({"fixed": fix, "report": report}), 200
+def worker_loop():
+    while True:
+        try:
+            task = task_q.get()
+            if task is None:
+                break
+            handle_product_task(**task)
+        except Exception as e:
+            print("❌ Worker error:", repr(e))
+        finally:
+            task_q.task_done()
+
+worker_thread = threading.Thread(target=worker_loop, daemon=True)
+worker_thread.start()
 
 # ── Shopify helpers ────────────────────────────────────────────────────────────
 def fetch_product(pid):
@@ -127,7 +111,7 @@ def delete_ab_product(ab_id):
     r = SESSION.delete(f"https://api.antiquesboutique.com/product/{ab_id}?sAPIKey={AB_API_KEY}", timeout=DEFAULT_TIMEOUT)
     print("🗑️ Deleted AB product" if r.status_code == 200 else f"❌ AB delete failed {r.status_code}")
 
-# ── Hash used to detect updates ────────────────────────────────────────────────
+# ── Update detection ───────────────────────────────────────────────────────────
 def compute_product_hash(prod):
     mf = prod.get("metafields", [])
     getm = lambda k: get_metafield_value(mf, "custom", k, "")
@@ -156,7 +140,7 @@ def send_to_ab(prod, ab_id=None):
 
     if not price and not DEFAULT_PRICE_RANGE_ID:
         print("❌ Missing price and no DEFAULT_PRICE_RANGE_ID")
-        return
+        return None
 
     d = {
         "sRef": sku,
@@ -166,12 +150,10 @@ def send_to_ab(prod, ab_id=None):
         "nShopProdPeriod_ID": getm("ab_period"),
         "nNationality_ID": getm("ab_item_nationality")
     }
-    if price:
-        d["nPrice"] = float(price)
-    else:
-        d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
+    if price: d["nPrice"] = float(price)
+    else:     d["nShopProdPriceRange_ID"] = int(DEFAULT_PRICE_RANGE_ID)
 
-    # Images: first is mandatory; send up to 20
+    # Images: up to 20, first is mandatory
     gallery = [img.get("src","") for img in (prod.get("images") or []) if img.get("src")]
     if not gallery:
         main = prod.get("image",{}).get("src")
@@ -179,12 +161,11 @@ def send_to_ab(prod, ab_id=None):
     for idx, url in enumerate(gallery[:20], start=1):
         d[f"sImageURL_{idx}"] = url
 
-    # External URL — use PUBLIC domain (set SHOPIFY_PUBLIC_DOMAIN env)
+    # External URL — use PUBLIC domain
     handle = prod.get("handle")
     if handle:
         d["sExternalURL"] = f"https://{SHOPIFY_PUBLIC_DOMAIN}/products/{handle}"
 
-    # POST to AB
     r = SESSION.post(
         f"https://api.antiquesboutique.com/product/{ab_id or ''}?sAPIKey={AB_API_KEY}",
         headers={"Content-Type":"application/x-www-form-urlencoded"},
@@ -194,26 +175,15 @@ def send_to_ab(prod, ab_id=None):
     if r.status_code != 200:
         print("❌ AB sync error:", r.text)
         return None
-
     return r.json()
 
-# ── Webhook listener ───────────────────────────────────────────────────────────
-@app.route("/webhook/products", methods=["POST"])
-def handle_webhook():
-    # HMAC verify
-    data = request.get_data()
-    digest = hmac.new(SHOPIFY_API_SECRET.encode(), data, hashlib.sha256).digest()
-    if not hmac.compare_digest(base64.b64encode(digest).decode(), request.headers.get("X-Shopify-Hmac-Sha256","")):
-        abort(401)
-
-    payload = json.loads(data)
-    pid = payload.get("id")
-    topic = request.headers.get("X-Shopify-Topic","")
-
-    if is_debounced(pid, topic):
-        return "Debounced", 200
-
+# ── Worker task handler (runs off-thread) ──────────────────────────────────────
+def handle_product_task(pid, topic):
+    # Always refetch fresh state
     prod = fetch_product(pid)
+    if not prod:
+        print(f"⚠️ Product {pid} not found")
+        return
     prod["metafields"] = fetch_metafields(pid)
 
     tags = (prod.get("tags") or "").lower()
@@ -225,44 +195,46 @@ def handle_webhook():
     lock    = get_metafield_value(prod["metafields"], "custom", "ab_sync_status")
 
     if topic == "products/create":
-        time.sleep(3)  # give Shopify a sec to finish writing images, etc.
+        time.sleep(2)  # let Shopify finish image writes
         if ab_id:
             print("⛔️ Already on AB")
-        elif lock == "creating":
-            print("⏳ Create in progress — skipping duplicate create")
-        elif status=="active" and "old" in tags and inv>0 and (not pub_val or pub_val!="true"):
-            print("✅ Creating new AB product")
-            create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "creating")
-            try:
-                resp = send_to_ab(prod)
-                if resp and resp.get("nShopProd_ID"):
-                    create_metafield(pid, "custom", "ab_product_id", "single_line_text_field", str(resp["nShopProd_ID"]))
-                    create_metafield(pid, "custom", "published_on_ab", "boolean", "true")
-                    h = compute_product_hash(prod)
-                    create_metafield(pid, "custom", "last_synced_hash", "single_line_text_field", h)
-                else:
-                    print("⚠️ AB did not return nShopProd_ID")
-            finally:
-                create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "")
-        else:
+            return
+        if lock == "creating":
+            print("⏳ Create in progress — skip")
+            return
+        if not (status=="active" and "old" in tags and inv>0 and (not pub_val or pub_val!="true")):
             print("⛔️ Create criteria not met")
+            return
+
+        print("✅ Creating on AB")
+        create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "creating")
+        try:
+            resp = send_to_ab(prod)
+            if resp and resp.get("nShopProd_ID"):
+                create_metafield(pid, "custom", "ab_product_id", "single_line_text_field", str(resp["nShopProd_ID"]))
+                create_metafield(pid, "custom", "published_on_ab", "boolean", "true")
+                h = compute_product_hash(prod)
+                create_metafield(pid, "custom", "last_synced_hash", "single_line_text_field", h)
+            else:
+                print("⚠️ AB did not return nShopProd_ID")
+        finally:
+            create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "")
 
     else:  # products/update
-        # Deletion rules
+        # deletion rules
         if ab_id and ("old" not in tags or status=="draft" or inv<=0):
             if check_ab_product_exists(ab_id):
                 delete_ab_product(ab_id)
             clear_ab_metafields(pid)
-            return "Deleted from AB", 200
+            print("🗑️ Deleted from AB due to rules")
+            return
 
-        # Skip updates while a create is in-flight
         if lock == "creating":
-            print("⏳ Create in progress — skipping update/recreate")
-            return "Create in progress", 200
+            print("⏳ Create in progress — skip update/recreate")
+            return
 
-        # Recreate when back in qualifying state
         if not ab_id and status=="active" and "old" in tags and inv>0:
-            print("🔁 Recreating product on AB")
+            print("🔁 Recreating on AB")
             create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "creating")
             try:
                 resp = send_to_ab(prod)
@@ -273,22 +245,80 @@ def handle_webhook():
                     create_metafield(pid, "custom", "last_synced_hash", "single_line_text_field", h)
             finally:
                 create_metafield(pid, "custom", "ab_sync_status", "single_line_text_field", "")
-            return "Recreated on AB", 200
+            return
 
-        # Normal update when material fields (incl. images/URL) changed
+        # normal update
         last = get_metafield_value(prod["metafields"], "custom", "last_synced_hash")
         new_hash = compute_product_hash(prod)
         if new_hash != last and ab_id and "old" in tags and status=="active" and inv>0:
             print("🔄 Updating AB product")
             resp = send_to_ab(prod, ab_id=ab_id)
-            if resp:  # on success, store new hash
+            if resp:
                 create_metafield(pid, "custom", "last_synced_hash", "single_line_text_field", new_hash)
         else:
             print("⛔️ No AB update or sync needed")
 
-    return "Webhook processed", 200
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
+
+@app.route("/register_webhook", methods=["GET"])
+def register_webhook():
+    topics = ["products/create", "products/update"]
+    results = []
+    existing = SESSION.get(f"{REST_BASE}/webhooks.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT).json().get("webhooks", [])
+    for topic in topics:
+        addr = f"{WEBHOOK_CALLBACK_URL}/webhook/products"
+        if any(w["topic"]==topic and w["address"]==addr for w in existing):
+            results.append({"topic": topic, "status": "exists"})
+            continue
+        payload = {"webhook": {"topic": topic, "address": addr, "format": "json"}}
+        resp = SESSION.post(f"{REST_BASE}/webhooks.json", headers=HEADERS, json=payload, timeout=DEFAULT_TIMEOUT)
+        results.append({"topic": topic, "status": resp.status_code, "body": resp.json()})
+    return jsonify(results), 200
+
+@app.route("/webhooks_audit", methods=["POST"])
+def webhooks_audit():
+    data = request.get_json(silent=True) or {}
+    fix = bool(data.get("fix"))
+    addr = f"{WEBHOOK_CALLBACK_URL}/webhook/products"
+    res = SESSION.get(f"{REST_BASE}/webhooks.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT).json()
+    webhooks = res.get("webhooks", [])
+    report = {}
+    for topic in ("products/create","products/update"):
+        matches = [w for w in webhooks if w["topic"]==topic and w["address"]==addr]
+        report[topic] = [{"id": w["id"], "address": w["address"]} for w in matches]
+        if fix and len(matches)>1:
+            keep = max(matches, key=lambda w: w["created_at"])
+            for w in matches:
+                if w["id"] != keep["id"]:
+                    SESSION.delete(f"{REST_BASE}/webhooks/{w['id']}.json", headers=HEADERS, timeout=DEFAULT_TIMEOUT)
+    return jsonify({"fixed": fix, "report": report}), 200
+
+# Shopify will sometimes send "//webhook/products"; Flask will still match, but this keeps logs tidy
+@app.route("/webhook/products", methods=["POST"])
+def enqueue_webhook():
+    # Verify HMAC quickly
+    raw = request.get_data()
+    digest = hmac.new(SHOPIFY_API_SECRET.encode(), raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(base64.b64encode(digest).decode(), request.headers.get("X-Shopify-Hmac-Sha256","")):
+        abort(401)
+
+    payload = json.loads(raw)
+    pid = payload.get("id")
+    topic = request.headers.get("X-Shopify-Topic","")
+
+    # soft debounce (still enqueue one task)
+    if not is_debounced(pid, topic):
+        try:
+            task_q.put_nowait({"pid": pid, "topic": topic})
+        except queue.Full:
+            print("⚠️ Task queue full; dropping event")
+    # Respond immediately so Shopify doesn’t retry
+    return "Queued", 200
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # If you control gunicorn, also set a sensible worker timeout (e.g., 60s)
+    # For local dev only; production should run via gunicorn
     app.run()
