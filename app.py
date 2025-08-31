@@ -20,7 +20,7 @@ AB_API_KEY = os.getenv("AB_API_KEY")
 DEFAULT_PRICE_RANGE_ID = os.getenv("DEFAULT_PRICE_RANGE_ID")
 WEBHOOK_CALLBACK_URL = os.getenv("WEBHOOK_CALLBACK_URL")
 
-SHOPIFY_API_VERSION = "2023-10"
+SHOPIFY_API_VERSION = "2025-04"
 HEADERS = {
     "Content-Type": "application/json",
     "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
@@ -201,8 +201,41 @@ def handle_webhook():
 # This endpoint is only for convenience if you want to manually register webhooks.
 @app.route("/register_webhook", methods=["GET"])
 def register_webhook():
-    # ... code to register webhooks, unchanged ...
-    return "This endpoint is for manual webhook registration."
+    if not (SHOPIFY_ACCESS_TOKEN and SHOPIFY_STORE_DOMAIN and WEBHOOK_CALLBACK_URL):
+        return "Missing env vars (token/domain/callback).", 500
+
+    api_version = "2025-04"  # update from 2023-10
+    base = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{api_version}"
+    h = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
+    }
+
+    # Read existing webhooks so we can upsert
+    try:
+        existing = requests.get(f"{base}/webhooks.json", headers=h, timeout=15).json().get("webhooks", [])
+    except Exception as e:
+        return f"Failed to read existing webhooks: {e}", 500
+
+    desired = [
+        {"topic": "products/create", "address": f"{WEBHOOK_CALLBACK_URL}/webhook/products", "format": "json"},
+        {"topic": "products/update", "address": f"{WEBHOOK_CALLBACK_URL}/webhook/products", "format": "json"},
+        {"topic": "products/delete", "address": f"{WEBHOOK_CALLBACK_URL}/webhook/products", "format": "json"},
+    ]
+
+    def ensure_webhook(d):
+        # If a matching topic+address exists, do nothing
+        for w in existing:
+            if w.get("topic") == d["topic"] and w.get("address") == d["address"]:
+                return f"OK (exists): {d['topic']}"
+        # Otherwise create it
+        r = requests.post(f"{base}/webhooks.json", headers=h, json={"webhook": d}, timeout=15)
+        if r.status_code in (201, 202):
+            return f"Created: {d['topic']}"
+        return f"Create failed {d['topic']}: {r.status_code} {r.text}"
+
+    results = [ensure_webhook(d) for d in desired]
+    return "; ".join(results), 200
 
 if __name__ == "__main__":
     app.run()
